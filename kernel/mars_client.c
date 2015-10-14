@@ -382,13 +382,13 @@ static int client_get_info(struct client_output *output, struct mars_info *info)
 {
 	int status;
 
-	output->got_info = false;
 	output->get_info = true;
 	wake_up_interruptible_all(&output->bundle.sender_event);
 	
-	wait_event_interruptible_timeout(output->info_event, output->got_info, 60 * HZ);
+	wait_event_interruptible_timeout(output->info_event, output->got_info, 20 * HZ);
 	status = -ETIME;
 	if (output->got_info && info) {
+		output->got_info = false;
 		memcpy(info, &output->info, sizeof(*info));
 		status = 0;
 	}
