@@ -602,17 +602,16 @@ void _inf_callback(struct trans_logger_input *input, bool force)
 	}
 }
 
-static inline 
-int _congested(struct trans_logger_brick *brick)
+static inline
+int _congested(struct trans_logger_brick *brick, int nr_queues)
 {
-	return atomic_read(&brick->q_phase[0].q_queued)
-		|| atomic_read(&brick->q_phase[0].q_flying)
-		|| atomic_read(&brick->q_phase[1].q_queued)
-		|| atomic_read(&brick->q_phase[1].q_flying)
-		|| atomic_read(&brick->q_phase[2].q_queued)
-		|| atomic_read(&brick->q_phase[2].q_flying)
-		|| atomic_read(&brick->q_phase[3].q_queued)
-		|| atomic_read(&brick->q_phase[3].q_flying);
+	int i;
+
+	for (i = 0; i < nr_queues; i++)
+		if (atomic_read(&brick->q_phase[i].q_queued) ||
+		    atomic_read(&brick->q_phase[i].q_flying))
+			return 1;
+	return 0;
 }
 
 ////////////////// own brick / input / output operations //////////////////
@@ -823,7 +822,7 @@ int trans_logger_ref_get(struct trans_logger_output *output, struct mref_object 
 		 * We have to this because writeback is out-of-order.
 		 * Otherwise consistency could be violated for some time.
 		 */
-		while (_congested(brick)) {
+		while (_congested(brick, LOGGER_QUEUES)) {
 			// in case of emergency, busy-wait should be acceptable
 			brick_msleep(HZ / 10);
 		}
@@ -2591,7 +2590,7 @@ void trans_logger_log(struct trans_logger_brick *brick)
 
 	mars_power_led_on((void*)brick, true);
 
-	while (!brick_thread_should_stop() || _congested(brick)) {
+	while (!brick_thread_should_stop() || _congested(brick, LOGGER_QUEUES)) {
 		int winner;
 		int nr;
 
@@ -2615,7 +2614,7 @@ void trans_logger_log(struct trans_logger_brick *brick)
 
 		if (brick->cease_logging) {
 			brick->stopped_logging = true;
-		} else if (brick->stopped_logging && !_congested(brick)) {
+		} else if (brick->stopped_logging && !_congested(brick, LOGGER_QUEUES)) {
 			brick->stopped_logging = false;
 		}
 
@@ -3185,7 +3184,7 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 brick->log_reads,
 		 brick->cease_logging,
 		 brick->stopped_logging,
-		 _congested(brick),
+		 _congested(brick, LOGGER_QUEUES),
 		 brick->replay_start_pos,
 		 brick->replay_end_pos,
 		 brick->new_input_nr,
