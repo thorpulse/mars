@@ -27,6 +27,7 @@
 #define REGION_SIZE_BITS      (PAGE_SHIFT + 4)
 #define REGION_SIZE           (1 << REGION_SIZE_BITS)
 #define LOGGER_QUEUES         4
+#define EXTRA_QUEUES          (LOGGER_QUEUES + 1)
 
 #include <linux/time.h>
 #include <net/sock.h>
@@ -116,6 +117,7 @@ struct trans_logger_mref_aspect {
 	struct trans_logger_brick *my_brick;
 	struct trans_logger_input *my_input;
 	struct trans_logger_input *log_input;
+	struct logger_queue *my_queue;
 	struct logger_head lh;
 	struct list_head hash_head;
 	//struct list_head q_head;
@@ -215,8 +217,8 @@ struct trans_logger_brick {
 	atomic_t total_restart_count;
 	atomic_t total_delay_count;
 	// queues
-	struct logger_queue q_phase[LOGGER_QUEUES];
-	struct rank_data rkd[LOGGER_QUEUES];
+	struct logger_queue q_phase[EXTRA_QUEUES];
+	struct rank_data rkd[EXTRA_QUEUES];
 	bool   delay_callers;
 };
 

@@ -821,20 +821,24 @@ int trans_logger_ref_get(struct trans_logger_output *output, struct mref_object 
 		return _read_ref_get(output, mref_a);
 	}
 
-	if (unlikely(brick->stopped_logging)) { // only in EMERGENCY mode
+	/* Only in emergency mode: directly access the underlying disk.
+	 */
+	if (brick->stopped_logging) { // only in EMERGENCY mode
+		struct trans_logger_input *input = brick->inputs[TL_INPUT_READ];
+
 		mref_a->is_emergency = true;
-		/* Wait until writeback has finished.
-		 * We have to this because writeback is out-of-order.
-		 * Otherwise consistency could be violated for some time.
-		 */
-		while (_congested(brick, LOGGER_QUEUES)) {
-			// in case of emergency, busy-wait should be acceptable
-			brick_msleep(HZ / 10);
-		}
-		return _read_ref_get(output, mref_a);
+		return GENERIC_INPUT_CALL(input, mref_get, mref);
 	}
 
-	/* FIXME: THIS IS PROVISIONARY (use event instead)
+	/* FIXME: THIS IS PROVISIONARY PARANOIA, to be removed.
+	 * It should not be necessary at all, but when trying to get
+	 * better reliability than hardware (more than 99.999%)
+	 * I became a little bit paranoid.
+	 * I found some extremely rare unexplainable cases where IO was
+	 * probably submitted by XFS _after_ the device was closed.
+	 * Reproduction is extremely hard.
+	 * Probably the session management of iSCSI may also play a role
+	 * at the wrong moment.
 	 */
 	while (unlikely(!brick->power.led_on)) {
 		brick_msleep(HZ / 10);
@@ -981,6 +985,8 @@ void _trans_logger_endio(struct generic_callback *cb)
 
 	NEXT_CHECKED_CALLBACK(cb, err);
 
+	if (mref_a->my_queue)
+		qq_dec_flying(mref_a->my_queue);
 	atomic_dec(&brick->any_fly_count);
 	atomic_inc(&brick->total_cb_count);
 	wake_up_interruptible_all(&brick->worker_event);
@@ -1047,6 +1053,19 @@ void trans_logger_ref_io(struct trans_logger_output *output, struct mref_object 
 		atomic_inc(&brick->total_write_count);
 	} else {
 		atomic_inc(&brick->total_read_count);
+	}
+
+	if (mref_a->is_emergency && _congested(brick, LOGGER_QUEUES)) {
+		/* Only during transition from writeback mode to emergency mode:
+		 * Wait until writeback has finished, by queuing into the last queue.
+		 * We have to do this because writeback is out-of-order.
+		 * Otherwise storage semantics could be violated for some time.
+		 */
+		_mref_get(mref); // must be paired with __trans_logger_ref_put()
+		atomic_inc(&brick->any_fly_count);
+		qq_mref_insert(&brick->q_phase[4], mref_a);
+		wake_up_interruptible_all(&brick->worker_event);
+		return;
 	}
 
 	__trans_logger_ref_io(brick, mref_a);
@@ -2074,7 +2093,39 @@ bool phase3_startio(struct writeback_info *wb)
 	return true;
 }
 
-/********************************************************************* 
+/*********************************************************************
+ * Phase 4: only used during transition from normal operations
+ * to emergency mode.
+ * This is needed to guarantee consistency.
+ * Writeback must have fully completed before the underlying disk
+ * can be accessed directly.
+ */
+
+static noinline
+bool phase4_startio(struct trans_logger_mref_aspect *mref_a)
+{
+	struct mref_object *mref;
+	struct trans_logger_brick *brick;
+
+	CHECK_PTR(mref_a, err);
+	mref = mref_a->object;
+	CHECK_PTR(mref, err);
+	brick = mref_a->my_brick;
+	CHECK_PTR(brick, err);
+
+	mref_a->my_queue = &brick->q_phase[4];
+	qq_inc_flying(&brick->q_phase[4]);
+	__trans_logger_ref_io(brick, mref_a);
+	atomic_dec(&brick->any_fly_count);
+	__trans_logger_ref_put(brick, mref_a);
+
+	return true;
+
+ err:
+	return false;
+}
+
+/*********************************************************************
  * The logger thread.
  * There is only a single instance, dealing with all requests in parallel.
  */
@@ -2094,7 +2145,7 @@ int run_mref_queue(struct logger_queue *q, bool (*startio)(struct trans_logger_m
 		if (!mref_a)
 			goto done;
 
-		if (do_limit && likely(mref_a->object))
+		if (likely(mref_a->object))
 			total_len += mref_a->object->ref_len;
 
 		ok = startio(mref_a);
@@ -2109,7 +2160,8 @@ int run_mref_queue(struct logger_queue *q, bool (*startio)(struct trans_logger_m
 
 done:
 	if (found) {
-		mars_limit(&global_writeback.limiter, (total_len - 1) / 1024 + 1);
+		if (do_limit && total_len)
+			mars_limit(&global_writeback.limiter, (total_len - 1) / 1024 + 1);
 		wake_up_interruptible_all(&brick->worker_event);
 	}
 	return res;
@@ -2394,6 +2446,14 @@ int _do_ranking(struct trans_logger_brick *brick)
 
 	res = ranking_select(rkd, LOGGER_QUEUES);
 
+	/* Ensure that the extra queue is only run when all others are empty.
+	 */
+	if (res < 0 &&
+	    atomic_read(&brick->q_phase[EXTRA_QUEUES - 1].q_queued) &&
+	    !_congested(brick, LOGGER_QUEUES)) {
+		res = EXTRA_QUEUES - 1;
+	}
+
 #ifdef IO_DEBUGGING
 	for (i = 0; i < LOGGER_QUEUES; i++) {
 		MARS_IO("rkd[%d]: points = %lld tmp = %lld got = %lld\n", i, rkd[i].rkd_current_points, rkd[i].rkd_tmp, rkd[i].rkd_got);
@@ -2602,7 +2662,7 @@ void trans_logger_log(struct trans_logger_brick *brick)
 
 	mars_power_led_on((void*)brick, true);
 
-	while (!brick_thread_should_stop() || _congested(brick, LOGGER_QUEUES)) {
+	while (!brick_thread_should_stop() || _congested(brick, EXTRA_QUEUES)) {
 		int winner;
 		int nr;
 
@@ -2626,7 +2686,7 @@ void trans_logger_log(struct trans_logger_brick *brick)
 
 		if (brick->cease_logging) {
 			brick->stopped_logging = true;
-		} else if (brick->stopped_logging && !_congested(brick, LOGGER_QUEUES)) {
+		} else if (brick->stopped_logging && !_congested(brick, EXTRA_QUEUES)) {
 			brick->stopped_logging = false;
 		}
 
@@ -2656,6 +2716,9 @@ void trans_logger_log(struct trans_logger_brick *brick)
 			}
 			nr = run_wb_queue(&brick->q_phase[3], phase3_startio, brick->q_phase[3].q_batchlen);
 			interleave += nr;
+			goto done;
+		case 4:
+			nr = run_mref_queue(&brick->q_phase[4], phase4_startio, brick->q_phase[4].q_batchlen, false);
 		done:
 			if (unlikely(nr <= 0)) {
 				/* This should not happen!
@@ -3169,7 +3232,8 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 "phase0=%d "
 		 "phase1=%d "
 		 "phase2=%d "
-		 "phase3=%d | "
+		 "phase3=%d "
+		 "phase4=%d | "
 		 "current #mrefs = %d "
 		 "shadow_mem_used=%ld/%lld "
 		 "replay_count=%d "
@@ -3188,7 +3252,8 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 "phase0=%d+%d <%d/%d> "
 		 "phase1=%d+%d <%d/%d> "
 		 "phase2=%d+%d <%d/%d> "
-		 "phase3=%d+%d <%d/%d>\n",
+		 "phase3=%d+%d <%d/%d> "
+		 "phase4=%d+%d <%d/%d>\n",
 		 brick->replay_mode,
 		 brick->continuous_replay_mode,
 		 brick->replay_code,
@@ -3196,7 +3261,7 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 brick->log_reads,
 		 brick->cease_logging,
 		 brick->stopped_logging,
-		 _congested(brick, LOGGER_QUEUES),
+		 _congested(brick, EXTRA_QUEUES),
 		 brick->replay_start_pos,
 		 brick->replay_end_pos,
 		 brick->new_input_nr,
@@ -3233,6 +3298,7 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 atomic_read(&brick->q_phase[1].q_total),
 		 atomic_read(&brick->q_phase[2].q_total),
 		 atomic_read(&brick->q_phase[3].q_total),
+		 atomic_read(&brick->q_phase[4].q_total),
 		 atomic_read(&brick->mref_object_layout.alloc_count),
 		 atomic64_read(&brick->shadow_mem_used) / 1024,
 		 brick_global_memlimit,
@@ -3268,7 +3334,11 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 atomic_read(&brick->q_phase[3].q_queued),
 		 atomic_read(&brick->q_phase[3].q_flying),
 		 brick->q_phase[3].pushback_count,
-		 brick->q_phase[3].no_progress_count);
+		 brick->q_phase[3].no_progress_count,
+		 atomic_read(&brick->q_phase[4].q_queued),
+		 atomic_read(&brick->q_phase[4].q_flying),
+		 brick->q_phase[4].pushback_count,
+		 brick->q_phase[4].no_progress_count);
 	return res;
 }
 
@@ -3403,6 +3473,7 @@ int trans_logger_brick_construct(struct trans_logger_brick *brick)
 	qq_init(&brick->q_phase[1], brick);
 	qq_init(&brick->q_phase[2], brick);
 	qq_init(&brick->q_phase[3], brick);
+	qq_init(&brick->q_phase[4], brick);
 	brick->q_phase[0].q_insert_info   = "q0_ins";
 	brick->q_phase[0].q_pushback_info = "q0_push";
 	brick->q_phase[0].q_fetch_info    = "q0_fetch";
@@ -3415,6 +3486,8 @@ int trans_logger_brick_construct(struct trans_logger_brick *brick)
 	brick->q_phase[3].q_insert_info   = "q3_ins";
 	brick->q_phase[3].q_pushback_info = "q3_push";
 	brick->q_phase[3].q_fetch_info    = "q3_fetch";
+	brick->q_phase[4].q_insert_info   = "q4_ins";
+	brick->q_phase[4].q_pushback_info = "q4_push";
 	brick->new_input_nr = TL_INPUT_LOG1;
 	brick->log_input_nr = TL_INPUT_LOG1;
 	brick->old_input_nr = TL_INPUT_LOG1;
