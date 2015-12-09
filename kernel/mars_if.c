@@ -30,12 +30,10 @@
 //#define MARS_DEBUGGING
 //#define IO_DEBUGGING
 
-#define REQUEST_MERGING
 //#define ALWAYS_UNPLUG false // FIXME: does not work! single requests left over!
 #define ALWAYS_UNPLUG true
 #define ALWAYS_UNPLUG_FROM_EXTERNAL true
 #define PREFETCH_LEN PAGE_SIZE
-//#define FRONT_MERGE // FIXME: this does not work.
 //#define MODIFY_READAHEAD // don't use it, otherwise sequential IO will suffer
 
 // low-level device parameters
@@ -92,14 +90,6 @@ struct mars_limiter if_throttle = {
 EXPORT_SYMBOL_GPL(if_throttle);
 
 ///////////////////////// own type definitions ////////////////////////
-
-#define IF_HASH_MAX   (PAGE_SIZE / sizeof(struct if_hash_anchor))
-#define IF_HASH_CHUNK (PAGE_SIZE * 32)
-
-struct if_hash_anchor {
-	spinlock_t hash_lock;
-	struct list_head hash_anchor;
-};
 
 ///////////////////////// own static definitions ////////////////////////
 
@@ -284,16 +274,9 @@ void _if_unplug(struct if_input *input)
 	while (!list_empty(&tmp_list)) {
 		struct if_mref_aspect *mref_a;
 		struct mref_object *mref;
-		int hash_index;
-		unsigned long flags;
 
 		mref_a = container_of(tmp_list.next, struct if_mref_aspect, plug_head);
 		list_del_init(&mref_a->plug_head);
-
-		hash_index = mref_a->hash_index;
-		traced_lock(&input->hash_table[hash_index].hash_lock, flags);
-		list_del_init(&mref_a->hash_head);
-		traced_unlock(&input->hash_table[hash_index].hash_lock, flags);
 
                 mref = mref_a->object;
 
@@ -562,8 +545,6 @@ if_make_request(struct request_queue *q, struct bio *bio)
 		data += offset;
 
 		while (bv_len > 0) {
-			struct list_head *tmp;
-			int hash_index;
 			int this_len = 0;
 			unsigned long flags;
 
@@ -572,59 +553,6 @@ if_make_request(struct request_queue *q, struct bio *bio)
 
 			MARS_IO("rw = %d i = %d pos = %lld  bv_page = %p bv_offset = %d data = %p bv_len = %d\n", rw, i, pos, bvec->bv_page, bvec->bv_offset, data, bv_len);
 
-			hash_index = (pos / IF_HASH_CHUNK) % IF_HASH_MAX;
-
-#ifdef REQUEST_MERGING
-			traced_lock(&input->hash_table[hash_index].hash_lock, flags);
-			for (tmp = input->hash_table[hash_index].hash_anchor.next; tmp != &input->hash_table[hash_index].hash_anchor; tmp = tmp->next) {
-				struct if_mref_aspect *tmp_a;
-				struct mref_object *tmp_mref;
-				int i;
-
-				tmp_a = container_of(tmp, struct if_mref_aspect, hash_head);
-				tmp_mref = tmp_a->object;
-				if (tmp_a->orig_page != page || tmp_mref->ref_rw != rw || tmp_a->bio_count >= MAX_BIO || tmp_a->current_len + bv_len > tmp_a->max_len) {
-					continue;
-				}
-
-				if (tmp_mref->ref_data + tmp_a->current_len == data) {
-					goto merge_end;
-#ifdef FRONT_MERGE // FIXME: this cannot work. ref_data must never be changed. pre-allocate from offset 0 instead.
-				} else if (data + bv_len == tmp_mref->ref_data) {
-					goto merge_front;
-#endif
-				}
-				continue;
-
-#ifdef FRONT_MERGE // FIXME: this cannot work. ref_data must never be changed. pre-allocate from offset 0 instead.
-			merge_front:
-				tmp_mref->ref_data = data;
-#endif
-			merge_end:
-				tmp_a->current_len += bv_len;
-				mref = tmp_mref;
-				mref_a = tmp_a;
-				this_len = bv_len;
-				if (!do_skip_sync) {
-					mref->ref_skip_sync = false;
-				}
-
-				for (i = 0; i < mref_a->bio_count; i++) {
-					if (mref_a->orig_biow[i]->bio == bio) {
-						goto unlock;
-					}
-				}
-
-				CHECK_ATOMIC(&biow->bi_comp_cnt, 0);
-				atomic_inc(&biow->bi_comp_cnt);
-				mref_a->orig_biow[mref_a->bio_count++] = biow;
-				assigned = true;
-				goto unlock;
-			} // foreach hash collision list member
-
-		unlock:
-			traced_unlock(&input->hash_table[hash_index].hash_lock, flags);
-#endif
 			if (!mref) {
 				int prefetch_len;
 				error = -ENOMEM;
@@ -710,11 +638,6 @@ if_make_request(struct request_queue *q, struct bio *bio)
 //      end_remove_this
 
 				atomic_inc(&input->plugged_count);
-
-				mref_a->hash_index = hash_index;
-				traced_lock(&input->hash_table[hash_index].hash_lock, flags);
-				list_add_tail(&mref_a->hash_head, &input->hash_table[hash_index].hash_anchor);
-				traced_unlock(&input->hash_table[hash_index].hash_lock, flags);
 
 				traced_lock(&input->req_lock, flags);
 				list_add_tail(&mref_a->plug_head, &input->plug_anchor);
@@ -1229,7 +1152,6 @@ static int if_mref_aspect_init_fn(struct generic_aspect *_ini)
 {
 	struct if_mref_aspect *ini = (void*)_ini;
 	INIT_LIST_HEAD(&ini->plug_head);
-	INIT_LIST_HEAD(&ini->hash_head);
 	return 0;
 }
 
@@ -1237,7 +1159,6 @@ static void if_mref_aspect_exit_fn(struct generic_aspect *_ini)
 {
 	struct if_mref_aspect *ini = (void*)_ini;
 	CHECK_HEAD_EMPTY(&ini->plug_head);
-	CHECK_HEAD_EMPTY(&ini->hash_head);
 }
 
 MARS_MAKE_STATICS(if);
@@ -1258,17 +1179,6 @@ static int if_brick_destruct(struct if_brick *brick)
 
 static int if_input_construct(struct if_input *input)
 {
-	int i;
-
-	input->hash_table = brick_block_alloc(0, PAGE_SIZE);
-	if (unlikely(!input->hash_table)) {
-		MARS_ERR("cannot allocate hash table\n");
-		return -ENOMEM;
-	}
-	for (i = 0; i < IF_HASH_MAX; i++) {
-		spin_lock_init(&input->hash_table[i].hash_lock);
-		INIT_LIST_HEAD(&input->hash_table[i].hash_anchor);
-	}
 	INIT_LIST_HEAD(&input->plug_anchor);
 	spin_lock_init(&input->req_lock);
 	atomic_set(&input->flying_count, 0);
@@ -1283,12 +1193,7 @@ static int if_input_construct(struct if_input *input)
 
 static int if_input_destruct(struct if_input *input)
 {
-	int i;
-	for (i = 0; i < IF_HASH_MAX; i++) {
-		CHECK_HEAD_EMPTY(&input->hash_table[i].hash_anchor);
-	}
 	CHECK_HEAD_EMPTY(&input->plug_anchor);
-	brick_block_free(input->hash_table, PAGE_SIZE);
 	return 0;
 }
 

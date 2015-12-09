@@ -55,8 +55,6 @@ struct bio_wrapper {
 struct if_mref_aspect {
 	GENERIC_ASPECT(mref);
 	struct list_head plug_head;
-	struct list_head hash_head;
-	int hash_index;
 	int bio_count;
 	int current_len;
 	int max_len;
@@ -64,8 +62,6 @@ struct if_mref_aspect {
 	struct bio_wrapper *orig_biow[MAX_BIO];
 	struct if_input *input;
 };
-
-struct if_hash_anchor;
 
 struct if_input {
 	MARS_INPUT(if);
@@ -92,7 +88,6 @@ struct if_input {
 	atomic_t total_mref_read_count;
 	atomic_t total_mref_write_count;
 	spinlock_t req_lock;
-	struct if_hash_anchor *hash_table;
 };
 
 struct if_output {
