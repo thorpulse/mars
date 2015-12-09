@@ -812,6 +812,11 @@ int trans_logger_ref_get(struct trans_logger_output *output, struct mref_object 
 		mref->ref_len = REGION_SIZE - base_offset;
 	}
 
+	/* Reads are directly going through when possible.
+	 * When necessary, slave shadow buffers are used.
+	 * The latter happens only during re-read of data which is pending
+	 * in writeback.
+	 */
 	if (mref->ref_may_write == READ) {
 		return _read_ref_get(output, mref_a);
 	}
@@ -986,27 +991,10 @@ err:
 }
 
 static noinline
-void trans_logger_ref_io(struct trans_logger_output *output, struct mref_object *mref)
+void __trans_logger_ref_io(struct trans_logger_brick *brick, struct trans_logger_mref_aspect *mref_a)
 {
-	struct trans_logger_brick *brick = output->brick;
-	struct trans_logger_mref_aspect *mref_a;
 	struct trans_logger_mref_aspect *shadow_a;
 	struct trans_logger_input *input;
-
-	_mref_check(mref);
-
-	mref_a = trans_logger_mref_get_aspect(brick, mref);
-	CHECK_PTR(mref_a, err);
-	CHECK_ASPECT(mref_a, mref, err);
-
-	MARS_IO("pos = %lld len = %d\n", mref->ref_pos, mref->ref_len);
-
-	// statistics
-	if (mref->ref_rw) {
-		atomic_inc(&brick->total_write_count);
-	} else {
-		atomic_inc(&brick->total_read_count);
-	}
 
 	// is this a shadow buffer?
 	shadow_a = mref_a->shadow_ref;
@@ -1016,7 +1004,7 @@ void trans_logger_ref_io(struct trans_logger_output *output, struct mref_object 
 		CHECK_HEAD_EMPTY(&mref_a->hash_head);
 		CHECK_HEAD_EMPTY(&mref_a->pos_head);
 #endif
-		_mref_get(mref); // must be paired with __trans_logger_ref_put()
+		_mref_get(mref_a->object); // must be paired with __trans_logger_ref_put()
 		atomic_inc(&brick->inner_balance_count);
 
 		qq_mref_insert(&brick->q_phase[0], mref_a);
@@ -1025,19 +1013,43 @@ void trans_logger_ref_io(struct trans_logger_output *output, struct mref_object 
 	}
 
 	// only READ is allowed on non-shadow buffers
-	if (unlikely(mref->ref_rw != READ && !mref_a->is_emergency)) {
-		MARS_FAT("bad operation %d on non-shadow\n", mref->ref_rw);
+	if (unlikely(mref_a->object->ref_rw != READ && !mref_a->is_emergency)) {
+		MARS_FAT("bad operation %d on non-shadow\n", mref_a->object->ref_rw);
 	}
 
 	atomic_inc(&brick->any_fly_count);
 
+	INSERT_CALLBACK(mref_a->object, &mref_a->cb, _trans_logger_endio, mref_a);
+
+	input = brick->inputs[TL_INPUT_READ];
+
+	GENERIC_INPUT_CALL(input, mref_io, mref_a->object);
+}
+
+static noinline
+void trans_logger_ref_io(struct trans_logger_output *output, struct mref_object *mref)
+{
+	struct trans_logger_brick *brick = output->brick;
+	struct trans_logger_mref_aspect *mref_a;
+
+	_mref_check(mref);
+
+	mref_a = trans_logger_mref_get_aspect(brick, mref);
+	CHECK_PTR(mref_a, err);
+	CHECK_ASPECT(mref_a, mref, err);
+
+	MARS_IO("pos = %lld len = %d\n", mref->ref_pos, mref->ref_len);
+
 	mref_a->my_brick = brick;
 
-	INSERT_CALLBACK(mref, &mref_a->cb, _trans_logger_endio, mref_a);
+	// statistics
+	if (mref->ref_rw) {
+		atomic_inc(&brick->total_write_count);
+	} else {
+		atomic_inc(&brick->total_read_count);
+	}
 
-	input = output->brick->inputs[TL_INPUT_READ];
-
-	GENERIC_INPUT_CALL(input, mref_io, mref);
+	__trans_logger_ref_io(brick, mref_a);
 	return;
 err:
 	MARS_FAT("cannot handle IO\n");
