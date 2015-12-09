@@ -82,6 +82,8 @@ struct trans_logger_hash_anchor {
 #define HASH_PER_PAGE       (PAGE_SIZE / sizeof(struct trans_logger_hash_anchor))
 #define HASH_TOTAL          (NR_HASH_PAGES * HASH_PER_PAGE)
 
+#define STATIST_SIZE        2048
+
 ///////////////////////// global tuning ////////////////////////
 
 int trans_logger_completion_semantics = 1;
@@ -3189,16 +3191,17 @@ int trans_logger_switch(struct trans_logger_brick *brick)
 static noinline
 char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 {
-	char *res = brick_string_alloc(1024);
+	char *res = brick_string_alloc(STATIST_SIZE);
 	if (!res)
 		return NULL;
 
-	snprintf(res, 1023,
+	snprintf(res, STATIST_SIZE - 1,
 		 "mode replay=%d "
 		 "continuous=%d "
 		 "replay_code=%d "
 		 "disk_io_error=%d "
 		 "log_reads=%d | "
+		 "delay_callers = %d "
 		 "cease_logging=%d "
 		 "stopped_logging=%d "
 		 "congested=%d | "
@@ -3249,6 +3252,11 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 "log_fly=%d "
 		 "mref_flying1=%d "
 		 "mref_flying2=%d "
+		 "ban0=%d "
+		 "ban1=%d "
+		 "ban2=%d "
+		 "ban3=%d "
+		 "ban4=%d "
 		 "phase0=%d+%d <%d/%d> "
 		 "phase1=%d+%d <%d/%d> "
 		 "phase2=%d+%d <%d/%d> "
@@ -3259,6 +3267,7 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 brick->replay_code,
 		 brick->disk_io_error,
 		 brick->log_reads,
+		 brick->delay_callers,
 		 brick->cease_logging,
 		 brick->stopped_logging,
 		 _congested(brick, EXTRA_QUEUES),
@@ -3319,6 +3328,11 @@ char *trans_logger_statistics(struct trans_logger_brick *brick, int verbose)
 		 atomic_read(&brick->log_fly_count),
 		 atomic_read(&brick->inputs[TL_INPUT_LOG1]->logst.mref_flying),
 		 atomic_read(&brick->inputs[TL_INPUT_LOG2]->logst.mref_flying),
+		 banning_is_hit(&brick->q_phase[0].q_banning),
+		 banning_is_hit(&brick->q_phase[1].q_banning),
+		 banning_is_hit(&brick->q_phase[2].q_banning),
+		 banning_is_hit(&brick->q_phase[3].q_banning),
+		 banning_is_hit(&brick->q_phase[4].q_banning),
 		 atomic_read(&brick->q_phase[0].q_queued),
 		 atomic_read(&brick->q_phase[0].q_flying),
 		 brick->q_phase[0].pushback_count,
