@@ -3782,21 +3782,22 @@ my %complex_macros =
    .  "}{None}",
 
    "role"
-   => "%if{%present-disk{}}{"
+   => "%let{remote}{%if{%match{%get-device{}}{\@}}{Remote}{}}"
+   .  "%if{%present-disk{}}{"
    .    "%if{%todo-primary{}}{"
    .      "%if{%is-primary{}}{"
-   .        "Primary"
+   .        "%{remote}Primary"
    .      "}{"
-   .        "NotYetPrimary"
+   .        "%{remote}NotYetPrimary"
    .      "}"
    .    "}{"
    .      "%if{%is-primary{}}{"
-   .        "RemainsPrimary"
+   .        "%{remote}RemainsPrimary"
    .      "}{"
-   .        "Secondary"
+   .        "%{remote}Secondary"
    .      "}"
    .    "}"
-   .  "}{None}",
+   .  "}{%{remote}None}",
 
    "role-1and1"
    => "%if{%present-disk{}}{"
