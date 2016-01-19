@@ -3680,7 +3680,7 @@ my %complex_macros =
    .    "%let{location}{%subst{%{device}}{\@}{ %{direction} }}"
    .    "Resource %{res} Device %{location}"
    .    "%elsif{%{present}}{"
-   .      " Present"
+   .      " Present[%device-ops-rate{} IOPS]"
    .    "}{%eq{%{direction}}{imported_from}}{"
    .      " NotPresent"
    .    "}\n"
