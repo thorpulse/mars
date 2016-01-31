@@ -462,6 +462,12 @@ if_make_request(struct request_queue *q, struct bio *bio)
 		goto done;
 	}
 
+	if (!brick->power.led_on) {
+		error = -ENOTCONN;
+		bio_endio(bio, error);
+		goto done;
+	}
+
 	biow = brick_mem_alloc(sizeof(struct bio_wrapper));
 	CHECK_PTR(biow, err);
 	biow->bio = bio;
@@ -479,12 +485,6 @@ if_make_request(struct request_queue *q, struct bio *bio)
 	 * Will be released after bio_endio().
 	 */
 	atomic_inc(&bio->bi_cnt);
-
-	/* FIXME: THIS IS PROVISIONARY (use event instead)
-	 */
-	while (unlikely(!brick->power.led_on)) {
-		brick_msleep(100);
-	}
 
 	down(&input->kick_sem);
 
@@ -969,16 +969,27 @@ static int if_switch(struct if_brick *brick)
 #endif
 
 		// point of no return
+
+		/* THINK: if add_disk() fails for some reason (e.g. wrong
+		 * device name), we won't notice it directly.
+		 * What could we do about that?
+		 */
+
 		MARS_DBG("add_disk()\n");
 		add_disk(disk);
+
+		/* Try to avoid IO races with block IO daemons etc
+		 * by doing this as early as possible, but not too
+		 * early.
+		 */
+		mars_power_led_on((void*)brick, true);
+
 #if 1
 		set_disk_ro(disk, false);
 #else
 		set_device_ro(input->bdev, 0); // TODO: implement modes
 #endif
 
-		// report success
-		mars_power_led_on((void*)brick, true);
 		status = 0;
 	}
 
