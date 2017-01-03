@@ -1657,8 +1657,7 @@ done:
 
 // remote workers
 
-static
-rwlock_t peer_lock = __RW_LOCK_UNLOCKED(&peer_lock);
+static DECLARE_RWSEM(peer_lock);
 
 static
 struct list_head peer_anchor = LIST_HEAD_INIT(peer_anchor);
@@ -1683,9 +1682,9 @@ struct mars_peerinfo *find_peer(const char *peer_name)
 {
 	struct list_head *tmp;
 	struct mars_peerinfo *res = NULL;
-	unsigned long flags;
 
-	read_lock_irqsave(&peer_lock, flags);
+	/* TODO: replace exhaustive search by better data structure */
+	down_read(&peer_lock);
 	for (tmp = peer_anchor.next; tmp != &peer_anchor; tmp = tmp->next) {
 		struct mars_peerinfo *peer = container_of(tmp, struct mars_peerinfo, peer_head);
 		if (!strcmp(peer->peer, peer_name)) {
@@ -1693,7 +1692,7 @@ struct mars_peerinfo *find_peer(const char *peer_name)
 			break;
 		}
 	}
-	read_unlock_irqrestore(&peer_lock, flags);
+	up_read(&peer_lock);
 
 	return res;
 }
@@ -2323,17 +2322,16 @@ void from_remote_trigger(void)
 {
 	struct list_head *tmp;
 	int count = 0;
-	unsigned long flags;
 
 	_make_alive();
 
-	read_lock_irqsave(&peer_lock, flags);
+	down_read(&peer_lock);
 	for (tmp = peer_anchor.next; tmp != &peer_anchor; tmp = tmp->next) {
 		struct mars_peerinfo *peer = container_of(tmp, struct mars_peerinfo, peer_head);
 		peer->from_remote_trigger = true;
 		count++;
 	}
-	read_unlock_irqrestore(&peer_lock, flags);
+	up_read(&peer_lock);
 
 	MARS_DBG("got trigger for %d peers\n", count);
 	wake_up_interruptible_all(&remote_event);
@@ -2345,15 +2343,14 @@ void __mars_remote_trigger(void)
 {
 	struct list_head *tmp;
 	int count = 0;
-	unsigned long flags;
 
-	read_lock_irqsave(&peer_lock, flags);
+	down_read(&peer_lock);
 	for (tmp = peer_anchor.next; tmp != &peer_anchor; tmp = tmp->next) {
 		struct mars_peerinfo *peer = container_of(tmp, struct mars_peerinfo, peer_head);
 		peer->to_remote_trigger = true;
 		count++;
 	}
-	read_unlock_irqrestore(&peer_lock, flags);
+	up_read(&peer_lock);
 
 	MARS_DBG("triggered %d peers\n", count);
 	wake_up_interruptible_all(&remote_event);
@@ -2395,9 +2392,9 @@ static int _kill_peer(struct mars_global *global, struct mars_peerinfo *peer)
 		return 0;
 	}
 
-	write_lock_irqsave(&peer_lock, flags);
+	down_write(&peer_lock);
 	list_del_init(&peer->peer_head);
-	write_unlock_irqrestore(&peer_lock, flags);
+	up_write(&peer_lock);
 
 	MARS_INF("stopping peer thread...\n");
 	if (peer->peer_thread) {
@@ -2428,7 +2425,6 @@ static int _make_peer(struct mars_global *global, struct mars_dent *dent, char *
 	char *mypeer;
 	char *parent_path;
 	int status = 0;
-	unsigned long flags;
 
 	if (!global || !dent || !dent->new_link || !dent->d_parent || !(parent_path = dent->d_parent->d_path)) {
 		MARS_DBG("cannot work\n");
@@ -2461,9 +2457,9 @@ static int _make_peer(struct mars_global *global, struct mars_dent *dent, char *
 		INIT_LIST_HEAD(&peer->peer_head);
 		INIT_LIST_HEAD(&peer->remote_dent_list);
 
-		write_lock_irqsave(&peer_lock, flags);
+		down_write(&peer_lock);
 		list_add_tail(&peer->peer_head, &peer_anchor);
-		write_unlock_irqrestore(&peer_lock, flags);
+		up_write(&peer_lock);
 	}
 
 	peer = dent->d_private;
