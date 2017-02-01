@@ -1617,7 +1617,7 @@ sub join_cluster {
   lprint "joining cluster via rsync (peer='$peer')\n";
   # check connection
   system("ssh -p $ssh_port $ssh_opts $peer uname -a") == 0 or ldie "oops, no connection to $peer ...\n";
-  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --max-size=1 -v $peer:$mars/ $mars/");
+  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --max-size=1 --update -v $peer:$mars/ $mars/");
   # check uniqness of IPs
   foreach my $other_ip_path (glob("$mars/ips/*")) {
     my $other_ip = get_link($other_ip_path, 1);
@@ -1625,7 +1625,7 @@ sub join_cluster {
   }
   _create_cluster(@_);
   finish_links();
-  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links -v $mars/ips/ $peer:$mars/ips/");
+  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --update -v $mars/ips/ $peer:$mars/ips/");
 }
 
 sub merge_cluster {
