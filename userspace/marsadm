@@ -1594,6 +1594,7 @@ sub _run_rsync {
     lprint "DRY_RUN: would execute the following command:\n$cmd\n";
     $cmd .= " --dry-run";
   }
+  finish_links();
   my $cycle = 0;
   my $status = 0;
   # Repeat the action because some symlinks might be updated (or even vanish)
@@ -1816,26 +1817,41 @@ sub create_res {
     ldie "could not create resource '$res'\n" unless -d $resdir;
     set_link($size, "$resdir/size");
   } else { # join
-    if (-d $resdir) {
+    # For safety, try to get the very newest infos.
+    # Reason: newer kernel modules will fetch non-member resource infos less frequently.
+    # Therefore we shift some responsibility for non-member -> member transitions to userspace.
+    my @peers = map { m:^$mars/ips/ip-(.+):; $1 } glob("$mars/ips/ip-*");
+    my $max_retry = 3;
+  retry: for (;;) {
       $primary = _get_designated_primary($res, 1);
-      # For safety, try to get the very newest infos
-      if ($primary && $primary ne "(none)") {
-	_run_rsync("rsync --recursive --links --max-size=1 --update -v $primary:$mars/resource-$res/ $mars/resource-$res/", $res, 1);
+      if ($max_retry-- <= 0) {
+	lwarn "cannot get a relevant primary";
+	last;
       }
-    }
-    if (!-d $resdir || !_get_designated_primary($res, 1)) {
-      # We are desperate. Try to fetch the directory from anywhere.
-      my @peers = glob("$mars/ips/ip-*");
-      my $max_rsync = 3;
-      foreach my $peer (map { m:^$mars/ips/ip-(.+):; $1 } @peers) {
-	next if $peer eq $real_host;
-	_run_rsync("rsync --recursive --links --max-size=1 --update -v $peer:$mars/resource-$res/ $mars/resource-$res/", $res, 1);
-	if (_get_designated_primary($res, 1)) {
-	  last if $max_rsync-- <= 0;
+      if (!$primary || $primary eq "(none)") {
+	# We are desperate. Try to fetch the directory from anywhere.
+	my $max_rsync = 5;
+	while (my $peer = shift @peers) {
+	  next if $peer eq $host;
+	  next if $peer eq $real_host;
+	  my $peer_ip = get_link("$mars/ips/ip->$peer");
+	  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --max-size=1 --update -v $peer_ip:$mars/resource-$res $mars/", $res, 1);
+	  $primary = _get_designated_primary($res, 1);
+	  next retry if $primary || $max_rsync-- <= 0;
 	}
       }
-      ldie "resource '$res' does not exist\n" unless -d $resdir;
-    }
+      if ($primary && $primary ne "(none)") {
+	my $old_primary = $primary;
+	my $peer_ip = get_link("$mars/ips/ip-$primary");
+	_run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --max-size=1 --update -v $peer_ip:$mars/resource-$res/ $mars/resource-$res/", $res, 1);
+	last if $primary eq $old_primary;
+      }
+      last unless @peers;
+    } # retry loop
+    ldie "resource '$res' does not exist\n" unless -d $resdir;
+    ldie "resource '$res' has no designated primary\n" unless $primary && $primary ne "(none)";
+    finish_links();
+    wait_cluster($cmd, $res);
     my $res_size = get_link("$mars/resource-$res/size", 1);
     if ($size < $res_size) {
       lwarn "size of new device is only $size, but should be $res_size\n";
@@ -5465,7 +5481,7 @@ if ($cmd =~ "show|cron") {
 } elsif ($cmd =~ m/^set-.*-value$/) {
   $res = shift @args || helplist "numeric argument is missing\n";
   ldie "argument '$res' isn't numeric\n" unless $res =~ m/^[0-9.]+$/;
-} elsif ($cmd =~ m/^(join|merge)-cluster(-slave)?$/) {
+} elsif ($cmd =~ m/^(join|merge)-cluster$/) {
   $res = shift @args || helplist "peer argument is missing\n";
   system("ping -c1 $res") and ldie "peer '$res' is not pingable\n";
 } elsif (!($cmd =~ m/^(create|leave|wait)-cluster|merge-cluster-list|create-uuid|cat|[a-z]+-file/)) {
