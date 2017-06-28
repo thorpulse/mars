@@ -103,6 +103,7 @@ my $force = 0;
 my $timeout = -1;
 my $ip = "";
 my $ssh_port = 22;
+my $ssh_opts = "-o  StrictHostKeyChecking=no";
 my $kernel_version = 0;
 
 ##################################################################
@@ -1610,8 +1611,8 @@ sub join_cluster {
   ldie "mars module is loaded, please unload first\n" if is_module_loaded();
   lprint "joining cluster via rsync (peer='$peer')\n";
   # check connection
-  system("ssh -p $ssh_port $peer uname -a") == 0 or ldie "oops, no connection to $peer ...\n";
-  _run_rsync("rsync -e 'ssh -p $ssh_port' --recursive --links --max-size=1 -v $peer:$mars/ $mars/");
+  system("ssh -p $ssh_port $ssh_opts $peer uname -a") == 0 or ldie "oops, no connection to $peer ...\n";
+  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links --max-size=1 -v $peer:$mars/ $mars/");
   # check uniqness of IPs
   foreach my $other_ip_path (glob("$mars/ips/*")) {
     my $other_ip = get_link($other_ip_path, 1);
@@ -1619,7 +1620,7 @@ sub join_cluster {
   }
   _create_cluster(@_);
   finish_links();
-  _run_rsync("rsync -e 'ssh -p $ssh_port' --recursive --links -v $mars/ips/ $peer:$mars/ips/");
+  _run_rsync("rsync -e 'ssh -p $ssh_port $ssh_opts' --recursive --links -v $mars/ips/ $peer:$mars/ips/");
 }
 
 sub leave_cluster {
@@ -5094,6 +5095,8 @@ marsadm [<global_options>] view[-<macroname>] [<resource_name> | all ]
   --ssh-port=<port_nr>
     Override the default ssh port (22) for ssh and rsync.
     Useful for running {join,merge}-cluster on non-standard ssh ports.
+  --ssh-opts=\"<ssh_commandline_options>\"
+    Override the default ssh commandline options. Also used for rsync.
   --macro=<text>
     Handy for testing short macro evaluations at the command line.
 
@@ -5199,6 +5202,10 @@ foreach my $arg (@ARGV) {
   } elsif ($arg =~ s/--ssh[-_]port\s*=\s*([0-9]+)/$1/) {
     $ssh_port = $arg;
     lprint_stderr "Using SSH port '$ssh_port' from command line.\n";
+    next;
+  } elsif ($arg =~ s/--ssh[-_]opts\s*=\s*(.*)/$1/) {
+    $ssh_opts = $arg;
+    lprint_stderr "Using SSH options '$ssh_opts' from command line.\n";
     next;
   } elsif ($arg =~ s/--macro\s*=\s*(.*)/$1/) {
     $macro = $arg;
